@@ -1,11 +1,12 @@
-# Despliegue automático de la API en Azure Container Apps
-# Se ejecuta en cada push a main (excepto si solo cambia index.html) o a mano desde la pestaña Actions
+
+# Despliegue automático de FastAPI en Azure Container Apps
 name: Desplegar API en Azure
 
 on:
   push:
     branches: [main]
-    paths-ignore: ["index.html"]   # el frontend vive en Storage, no requiere reconstruir el Docker
+    paths-ignore:
+      - index.html
   workflow_dispatch:
 
 env:
@@ -13,58 +14,143 @@ env:
   ACR_NAME: acrmlopsean60126
   ENVIRONMENT: env-mlops-ean
   APP_NAME: api-mlops-ean
-  IMAGE: acrmlopsean60126.azurecr.io/api-mlops-ean:${{ github.sha }}   # cada versión con la etiqueta del commit
+  IMAGE: acrmlopsean60126.azurecr.io/api-mlops-ean:${{ github.sha }}
 
 jobs:
   desplegar:
     runs-on: ubuntu-latest
     steps:
-      # 1. Descarga el código del repositorio
-      - uses: actions/checkout@v4
 
-      # 2. Inicia sesión en Azure con la cuenta de servicio
-      - uses: azure/login@v2
+      # 1. Descargar el código
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      # 2. Iniciar sesión en Azure
+      - name: Iniciar sesion en Azure
+        uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # 3. Construye la imagen Docker y la sube al Container Registry
+      # 3. Construir y publicar imagen Docker
       - name: Construir y subir imagen
         run: |
-          az acr login --name $ACR_NAME
-          docker build -t $IMAGE .
-          docker push $IMAGE
+          az acr login --name "$ACR_NAME"
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
 
-      # 4. Crea la Container App la primera vez; las siguientes solo la actualiza
+      # 4. Crear o actualizar la API con Azure REST
       - name: Crear o actualizar la API
         env:
           DB_URL: ${{ secrets.DATABRICKS_URL }}
           DB_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
         run: |
-          if az containerapp show -n $APP_NAME -g $RESOURCE_GROUP > /dev/null 2>&1; then
-            echo "La API ya existe: se actualiza"
-            az containerapp secret set -n $APP_NAME -g $RESOURCE_GROUP \
-              --secrets databricks-url="$DB_URL" databricks-token="$DB_TOKEN"
-            az containerapp update -n $APP_NAME -g $RESOURCE_GROUP --image $IMAGE
-          else
-            echo "Primera vez: se crea la API"
-            ACR_PASSWORD=$(az acr credential show -n $ACR_NAME --query "passwords[0].value" -o tsv)
-            az containerapp create -n $APP_NAME -g $RESOURCE_GROUP \
-              --environment $ENVIRONMENT \
-              --image $IMAGE \
-              --registry-server $ACR_NAME.azurecr.io \
-              --registry-username $ACR_NAME \
-              --registry-password "$ACR_PASSWORD" \
-              --target-port 8000 \
-              --ingress external \
-              --min-replicas 0 \
-              --max-replicas 1 \
-              --secrets databricks-url="$DB_URL" databricks-token="$DB_TOKEN" \
-              --env-vars DATABRICKS_URL=secretref:databricks-url DATABRICKS_TOKEN=secretref:databricks-token
-          fi
+          SUB=$(az account show --query id -o tsv)
+          LOCATION=$(az group show -n "$RESOURCE_GROUP" --query location -o tsv)
+          APP_URL="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$APP_NAME?api-version=2024-03-01"
+          ENV_ID="/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/managedEnvironments/$ENVIRONMENT"
+          ACR_PASSWORD=$(az acr credential show -n "$ACR_NAME" --query 'passwords[0].value' -o tsv)
 
-      # 5. Muestra la URL pública de la API
-      - name: URL de la API
+          APP_JSON=$(mktemp)
+          trap 'rm -f "$APP_JSON"' EXIT
+
+          jq -n \
+            --arg loc "$LOCATION" \
+            --arg env "$ENV_ID" \
+            --arg image "$IMAGE" \
+            --arg server "$ACR_NAME.azurecr.io" \
+            --arg user "$ACR_NAME" \
+            --arg pass "$ACR_PASSWORD" \
+            --arg dburl "$DB_URL" \
+            --arg dbtoken "$DB_TOKEN" \
+            '{
+              location: $loc,
+              properties: {
+                environmentId: $env,
+                configuration: {
+                  ingress: {
+                    external: true,
+                    targetPort: 8000
+                  },
+                  registries: [
+                    {
+                      server: $server,
+                      username: $user,
+                      passwordSecretRef: "acr-password"
+                    }
+                  ],
+                  secrets: [
+                    {name: "acr-password", value: $pass},
+                    {name: "databricks-url", value: $dburl},
+                    {name: "databricks-token", value: $dbtoken}
+                  ]
+                },
+                template: {
+                  containers: [
+                    {
+                      name: "api",
+                      image: $image,
+                      resources: {
+                        cpu: 0.5,
+                        memory: "1Gi"
+                      },
+                      env: [
+                        {
+                          name: "DATABRICKS_URL",
+                          secretRef: "databricks-url"
+                        },
+                        {
+                          name: "DATABRICKS_TOKEN",
+                          secretRef: "databricks-token"
+                        }
+                      ]
+                    }
+                  ],
+                  scale: {
+                    minReplicas: 0,
+                    maxReplicas: 1
+                  }
+                }
+              }
+            }' > "$APP_JSON"
+
+          az rest --method put \
+            --url "$APP_URL" \
+            --body "@$APP_JSON" \
+            --query properties.provisioningState -o tsv
+
+          # Esperar hasta 6 minutos
+          for i in $(seq 1 36); do
+            STATE=$(az rest --method get \
+              --url "$APP_URL" \
+              --query properties.provisioningState -o tsv)
+
+            echo "Estado: $STATE"
+
+            if [ "$STATE" = "Succeeded" ]; then
+              echo "Container App desplegada correctamente."
+              exit 0
+            fi
+
+            if [ "$STATE" = "Failed" ] || [ "$STATE" = "Canceled" ]; then
+              echo "Error: aprovisionamiento $STATE"
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "Error: tiempo de espera agotado."
+          exit 1
+
+      # 5. Mostrar URL de FastAPI
+      - name: Mostrar URL de la API
         run: |
-          FQDN=$(az containerapp show -n $APP_NAME -g $RESOURCE_GROUP --query properties.configuration.ingress.fqdn -o tsv)
+          SUB=$(az account show --query id -o tsv)
+          APP_URL="https://management.azure.com/subscriptions/$SUB/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.App/containerApps/$APP_NAME?api-version=2024-03-01"
+
+          FQDN=$(az rest --method get \
+            --url "$APP_URL" \
+            --query properties.configuration.ingress.fqdn -o tsv)
+
           echo "API publicada en: https://$FQDN"
-          echo "Pruebe: https://$FQDN/health"
+          echo "Prueba: https://$FQDN/health"
